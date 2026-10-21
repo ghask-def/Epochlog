@@ -5,6 +5,7 @@ plugins {
 dependencies {
     implementation(project(":concurrency"))
     implementation(project(":log-storage"))
+    implementation(project(":clock"))
     implementation(libs.jcstress.core)
     annotationProcessor(libs.jcstress.core)
 }
