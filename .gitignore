@@ -1,0 +1,11 @@
+.gradle/
+build/
+out/
+.idea/
+*.iml
+.vscode/
+.DS_Store
+*.log
+data/
+jcstress-results*.bin.gz
+results/
