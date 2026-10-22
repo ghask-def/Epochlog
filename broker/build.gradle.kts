@@ -8,5 +8,6 @@ dependencies {
     api(project(":protocol"))
     api(project(":concurrency"))
     api(project(":clock"))
+    api(project(":replication"))
     testImplementation(project(":client"))
 }

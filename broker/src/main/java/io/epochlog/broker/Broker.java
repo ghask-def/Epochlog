@@ -5,6 +5,7 @@ import io.epochlog.common.Config;
 import io.epochlog.common.Time;
 import io.epochlog.common.TopicPartition;
 import io.epochlog.concurrent.GroupCommitter;
+import io.epochlog.network.NetworkClient;
 import io.epochlog.network.SocketServer;
 import io.epochlog.protocol.Errors;
 import io.epochlog.protocol.OffsetsTopic;
@@ -15,24 +16,30 @@ import io.epochlog.protocol.message.ErrorResponse;
 import io.epochlog.protocol.message.LeaderAndIsrRequest;
 import io.epochlog.protocol.message.PartitionErrorsResponse;
 import io.epochlog.protocol.message.PartitionState;
+import io.epochlog.replication.ReplicaFetcherManager;
+import io.epochlog.replication.ReplicaFetcherThread;
 import io.epochlog.storage.Log;
 import io.epochlog.storage.LogConfig;
 import io.epochlog.storage.LogManager;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.net.InetSocketAddress;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongSupplier;
+import java.util.function.UnaryOperator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * A broker process: wires storage, the replica manager, the clock and the network server
- * together and owns their lifecycle.
+ * together and owns their lifecycle. Runs standalone (it leads every partition and creates topics
+ * itself) or under a controller, which assigns leaders and followers.
  *
  * <p>Thread-safety: {@link #start} and {@link #close} must not race each other; everything else
  * is thread-safe.
@@ -52,10 +59,22 @@ public class Broker implements AutoCloseable {
     private SocketServer server;
     private ExecutorService handlerExecutor;
     private final ScheduledExecutorService scheduler;
+    private final UnaryOperator<InetSocketAddress> resolver;
+    private final AtomicBoolean offsetsTopicRequested = new AtomicBoolean();
+    private NetworkClient controllerClient;
+    private NetworkClient replicationClient;
+    private ControllerChannel controllerChannel;
+    private ReplicaFetcherManager fetchers;
     private volatile boolean started;
 
-    public Broker(BrokerConfig config, Time time, LongSupplier hlcPhysicalMillis) {
+    /**
+     * @param resolver maps an address this broker wants to connect to onto the one it actually
+     *     dials; tests use it to route traffic through fault-injecting proxies
+     */
+    public Broker(BrokerConfig config, Time time, LongSupplier hlcPhysicalMillis,
+            UnaryOperator<InetSocketAddress> resolver) {
         this.config = config;
+        this.resolver = resolver;
         this.time = time;
         this.clock = new HybridLogicalClock(hlcPhysicalMillis, config.maxClockDriftMs());
         this.logManager = new LogManager(config.dataDir(), config.logDefaults(), time,
@@ -69,6 +88,10 @@ public class Broker implements AutoCloseable {
                 Thread.ofPlatform().name("broker-" + config.brokerId() + "-scheduler").daemon().factory());
     }
 
+    public Broker(BrokerConfig config, Time time, LongSupplier hlcPhysicalMillis) {
+        this(config, time, hlcPhysicalMillis, UnaryOperator.identity());
+    }
+
     public Broker(BrokerConfig config) {
         this(config, Time.SYSTEM, System::currentTimeMillis);
     }
@@ -80,6 +103,19 @@ public class Broker implements AutoCloseable {
     public void start() throws IOException {
         logManager.startup();
         replicaManager = createReplicaManager();
+        if (!config.standalone()) {
+            controllerClient = new NetworkClient("broker-" + config.brokerId() + "-controller",
+                    "broker-" + config.brokerId(), config.requestTimeoutMs(), resolver);
+            replicationClient = new NetworkClient("broker-" + config.brokerId() + "-replication",
+                    "broker-" + config.brokerId(), config.requestTimeoutMs(), resolver);
+            controllerChannel = new ControllerChannel(config.brokerId(), config.controller(), controllerClient,
+                    this::self, metadataCache::version, config.heartbeatIntervalMs(), config.sessionTimeoutMs());
+            fetchers = new ReplicaFetcherManager(config.brokerId(), replicationClient,
+                    new ReplicaFetcherThread.Settings(config.replicaFetchMaxWaitMs(), config.replicaFetchMaxBytes(),
+                            config.replicaFetchMaxBytes(), 200, Math.max(5_000, config.replicaFetchMaxWaitMs() * 4L)),
+                    () -> controllerChannel.brokerEpoch());
+            replicaManager.enableClusterMode(controllerChannel, fetchers, metadataCache);
+        }
         offsetCoordinator = new OffsetCoordinator(replicaManager, metadataCache, this::ensureOffsetsTopic,
                 (int) config.requestTimeoutMs());
         handlerExecutor = config.virtualHandlerThreads()
@@ -97,11 +133,23 @@ public class Broker implements AutoCloseable {
                 config.virtualHandlerThreads() ? "virtual" : config.handlerThreads() + " platform");
     }
 
-    /** Standalone mode leads every partition found on disk. Cluster mode overrides this. */
+    /**
+     * Standalone mode leads every partition found on disk. In cluster mode the partitions are
+     * opened but take no role until the controller says so.
+     */
     protected void onStartup() throws IOException {
-        for (Log log : logManager.all()) {
-            becomeStandaloneLeader(log.topicPartition(), log.config());
+        if (config.standalone()) {
+            for (Log log : logManager.all()) {
+                becomeStandaloneLeader(log.topicPartition(), log.config());
+            }
+            return;
         }
+        for (Log log : logManager.all()) {
+            replicaManager.getOrCreatePartition(log.topicPartition(), log.config());
+        }
+        controllerChannel.start();
+        long period = Math.max(100, config.replicaLagTimeMaxMs() / 2);
+        scheduler.scheduleWithFixedDelay(replicaManager::maintainIsr, period, period, TimeUnit.MILLISECONDS);
     }
 
     private void becomeStandaloneLeader(TopicPartition tp, LogConfig cfg) throws IOException {
@@ -130,6 +178,9 @@ public class Broker implements AutoCloseable {
             return CompletableFuture.completedFuture(new ErrorResponse(Errors.INVALID_PARTITIONS,
                     "need at least one partition"));
         }
+        if (!config.standalone()) {
+            return controllerChannel.createTopic(req);
+        }
         return createTopicStandalone(req);
     }
 
@@ -154,15 +205,19 @@ public class Broker implements AutoCloseable {
     }
 
     protected void ensureOffsetsTopic() {
-        if (!metadataCache.topicExists(OffsetsTopic.NAME)) {
-            createTopic(new CreateTopicRequest(OffsetsTopic.NAME, config.offsetsTopicPartitions(), (short) -1,
-                    OffsetCoordinator.topicConfigs()));
+        if (metadataCache.topicExists(OffsetsTopic.NAME) || !offsetsTopicRequested.compareAndSet(false, true)) {
+            return;
         }
+        createTopic(new CreateTopicRequest(OffsetsTopic.NAME, config.offsetsTopicPartitions(), (short) -1,
+                OffsetCoordinator.topicConfigs()))
+                .whenComplete((r, err) -> offsetsTopicRequested.set(false));
     }
 
-    /** Only meaningful with a controller; a standalone broker has nobody to take orders from. */
-    public PartitionErrorsResponse handleLeaderAndIsr(LeaderAndIsrRequest req) {
-        return new PartitionErrorsResponse(Errors.NOT_CONTROLLER, List.of());
+    public PartitionErrorsResponse handleLeaderAndIsr(LeaderAndIsrRequest req) throws IOException {
+        if (config.standalone()) {
+            return new PartitionErrorsResponse(Errors.NOT_CONTROLLER, List.of());
+        }
+        return replicaManager.applyLeaderAndIsr(req);
     }
 
     long nextProducerId() throws IOException {
@@ -195,11 +250,23 @@ public class Broker implements AutoCloseable {
 
     protected void stopBackground() {
         scheduler.shutdownNow();
+        if (controllerChannel != null) {
+            controllerChannel.close();
+        }
         if (server != null) {
             server.close();
         }
         if (handlerExecutor != null) {
             handlerExecutor.shutdownNow();
+        }
+    }
+
+    private void closeClients() {
+        if (controllerClient != null) {
+            controllerClient.close();
+        }
+        if (replicationClient != null) {
+            replicationClient.close();
         }
     }
 
@@ -213,6 +280,7 @@ public class Broker implements AutoCloseable {
         if (replicaManager != null) {
             replicaManager.close();
         }
+        closeClients();
         if (committer != null) {
             committer.close();
         }
@@ -234,6 +302,7 @@ public class Broker implements AutoCloseable {
         if (replicaManager != null) {
             replicaManager.closeAbruptly();
         }
+        closeClients();
         if (committer != null) {
             committer.close();
         }

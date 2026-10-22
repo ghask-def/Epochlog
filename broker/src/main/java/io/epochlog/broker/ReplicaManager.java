@@ -1,6 +1,7 @@
 package io.epochlog.broker;
 
 import io.epochlog.clock.HybridLogicalClock;
+import io.epochlog.common.Config;
 import io.epochlog.common.HybridTime;
 import io.epochlog.common.RecordBatch;
 import io.epochlog.common.Time;
@@ -11,14 +12,20 @@ import io.epochlog.protocol.ApiKey;
 import io.epochlog.protocol.Errors;
 import io.epochlog.protocol.MemoryRecords;
 import io.epochlog.protocol.Records;
+import io.epochlog.protocol.message.BrokerInfo;
 import io.epochlog.protocol.message.FetchRequest;
 import io.epochlog.protocol.message.FetchResponse;
+import io.epochlog.protocol.message.LeaderAndIsrRequest;
 import io.epochlog.protocol.message.ListOffsetsRequest;
 import io.epochlog.protocol.message.ListOffsetsResponse;
 import io.epochlog.protocol.message.OffsetForLeaderEpochRequest;
 import io.epochlog.protocol.message.OffsetForLeaderEpochResponse;
+import io.epochlog.protocol.message.PartitionErrorsResponse;
+import io.epochlog.protocol.message.PartitionState;
+import io.epochlog.protocol.message.TopicConfig;
 import io.epochlog.protocol.message.ProduceRequest;
 import io.epochlog.protocol.message.ProduceResponse;
+import io.epochlog.replication.ReplicaFetcherManager;
 import io.epochlog.storage.FileSlice;
 import io.epochlog.storage.LogAppendInfo;
 import io.epochlog.storage.LogConfig;
@@ -28,10 +35,13 @@ import io.epochlog.storage.TimestampAndOffset;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -53,6 +63,9 @@ public class ReplicaManager implements Partition.Listener, AutoCloseable {
     protected final ConcurrentHashMap<TopicPartition, Partition> partitions = new ConcurrentHashMap<>();
     private final DelayedOperationPurgatory<DelayedProduce> producePurgatory;
     private final DelayedOperationPurgatory<DelayedFetch> fetchPurgatory;
+    private volatile ControllerChannel controllerChannel;
+    private volatile ReplicaFetcherManager fetchers;
+    private volatile MetadataCache metadataCache;
 
     public ReplicaManager(BrokerConfig config, LogManager logManager, HybridLogicalClock clock, GroupCommitter committer,
             Time time) {
@@ -88,7 +101,7 @@ public class ReplicaManager implements Partition.Listener, AutoCloseable {
                 return existing;
             }
             Partition p = new Partition(tp, logManager.getOrCreate(tp, logConfig), config.brokerId(), clock, committer,
-                    this, time);
+                    this, controllerChannel, time);
             partitions.put(tp, p);
             return p;
         }
@@ -105,8 +118,23 @@ public class ReplicaManager implements Partition.Listener, AutoCloseable {
         fetchPurgatory.checkAndComplete(tp);
     }
 
+    /** Switches on cluster mode: ISR changes go to the controller and followers fetch from leaders. */
+    void enableClusterMode(ControllerChannel channel, ReplicaFetcherManager fetcherManager, MetadataCache cache) {
+        this.controllerChannel = channel;
+        this.fetchers = fetcherManager;
+        this.metadataCache = cache;
+    }
+
     protected Errors checkProduceAllowed(Partition p) {
-        return p.isLeader() ? Errors.NONE : Errors.NOT_LEADER_OR_FOLLOWER;
+        if (!p.isLeader()) {
+            return Errors.NOT_LEADER_OR_FOLLOWER;
+        }
+        ControllerChannel channel = controllerChannel;
+        if (channel != null && !channel.leaseValid()) {
+            // We may already have been replaced; don't take writes the new leader won't have.
+            return Errors.NOT_LEADER_OR_FOLLOWER;
+        }
+        return Errors.NONE;
     }
 
     /** Appends every partition's batches and answers per the request's acks. */
@@ -235,8 +263,88 @@ public class ReplicaManager implements Partition.Listener, AutoCloseable {
         fetchPurgatory.tryCompleteElseWatch(op, keys);
     }
 
-    /** Hook for follower bookkeeping; the single-node broker has no followers. */
-    protected void onReplicaFetch(FetchRequest req) {}
+    /** Records follower progress before the read, so the response carries an up-to-date watermark. */
+    protected void onReplicaFetch(FetchRequest req) {
+        for (FetchRequest.PartitionData pd : req.partitions()) {
+            Partition p = partitions.get(new TopicPartition(pd.topic(), pd.partition()));
+            if (p != null && checkFetchEpoch(p, pd.currentLeaderEpoch()) == Errors.NONE) {
+                p.onFollowerFetch(req.replicaId(), pd.fetchOffset());
+            }
+        }
+    }
+
+    /** Drops lagging followers from every ISR this broker leads. */
+    public void maintainIsr() {
+        for (Partition p : partitions.values()) {
+            if (p.isLeader()) {
+                p.maybeShrinkIsr(config.replicaLagTimeMaxMs());
+            }
+        }
+    }
+
+    /**
+     * Applies a controller snapshot: becomes leader or follower for partitions whose leader epoch
+     * moved, updates the ISR where only that changed, and rejects anything older than what we
+     * already have.
+     */
+    public synchronized PartitionErrorsResponse applyLeaderAndIsr(LeaderAndIsrRequest req) throws IOException {
+        if (!metadataCache.update(req.metadataVersion(), req.controllerId(), req.liveBrokers(), req.partitions(),
+                req.topicConfigs())) {
+            return new PartitionErrorsResponse(Errors.NONE, List.of());
+        }
+        Map<String, Map<String, String>> topicConfigs = new HashMap<>();
+        for (TopicConfig tc : req.topicConfigs()) {
+            topicConfigs.put(tc.topic(), tc.configs());
+        }
+        Map<Integer, BrokerInfo> brokers = new HashMap<>();
+        for (BrokerInfo b : req.liveBrokers()) {
+            brokers.put(b.id(), b);
+        }
+        List<PartitionErrorsResponse.PartitionError> errors = new ArrayList<>();
+        List<CompletableFuture<Void>> transitions = new ArrayList<>();
+        int self = config.brokerId();
+        for (PartitionState ps : req.partitions()) {
+            if (!ps.replicas().contains(self)) {
+                continue;
+            }
+            TopicPartition tp = new TopicPartition(ps.topic(), ps.partition());
+            LogConfig cfg = LogConfig.from(new Config(logManager.defaults().toMap())
+                    .withAll(topicConfigs.getOrDefault(tp.topic(), Map.of())));
+            Partition p = getOrCreatePartition(tp, cfg);
+            if (ps.leaderEpoch() < p.leaderEpoch()) {
+                errors.add(new PartitionErrorsResponse.PartitionError(tp.topic(), tp.partition(),
+                        Errors.FENCED_LEADER_EPOCH));
+                continue;
+            }
+            if (ps.leaderEpoch() == p.leaderEpoch()) {
+                if (ps.partitionEpoch() > p.partitionEpoch()) {
+                    transitions.add(p.updateIsr(ps.partitionEpoch(), ps.replicas(), ps.isr()));
+                }
+                continue;
+            }
+            if (ps.leader() == self) {
+                fetchers.remove(tp);
+                transitions.add(p.becomeLeader(ps.leaderEpoch(), ps.partitionEpoch(), ps.replicas(), ps.isr()));
+            } else {
+                BrokerInfo leader = brokers.get(ps.leader());
+                transitions.add(p.becomeFollower(ps.leader(), ps.leaderEpoch(), ps.partitionEpoch(), ps.replicas(),
+                        ps.isr()).thenRun(() -> {
+                            if (leader != null) {
+                                fetchers.follow(p, leader);
+                            } else {
+                                fetchers.remove(tp);
+                            }
+                        }));
+            }
+        }
+        try {
+            CompletableFuture.allOf(transitions.toArray(new CompletableFuture<?>[0])).get(30, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            LOG.error("leadership transitions failed", e);
+            return new PartitionErrorsResponse(Errors.UNKNOWN, errors);
+        }
+        return new PartitionErrorsResponse(Errors.NONE, errors);
+    }
 
     protected FetchResponse readAll(FetchRequest req, boolean replica) {
         List<FetchResponse.PartitionData> out = new ArrayList<>(req.partitions().size());
@@ -350,8 +458,16 @@ public class ReplicaManager implements Partition.Listener, AutoCloseable {
         }
     }
 
+    private void stopFetchers() {
+        ReplicaFetcherManager f = fetchers;
+        if (f != null) {
+            f.shutdown();
+        }
+    }
+
     @Override
     public void close() {
+        stopFetchers();
         producePurgatory.close();
         fetchPurgatory.close();
         for (Partition p : partitions.values()) {
@@ -360,6 +476,7 @@ public class ReplicaManager implements Partition.Listener, AutoCloseable {
     }
 
     public void closeAbruptly() {
+        stopFetchers();
         producePurgatory.close();
         fetchPurgatory.close();
         for (Partition p : partitions.values()) {
