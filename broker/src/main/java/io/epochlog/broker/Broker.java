@@ -78,7 +78,7 @@ public class Broker implements AutoCloseable {
         this.time = time;
         this.clock = new HybridLogicalClock(hlcPhysicalMillis, config.maxClockDriftMs());
         this.logManager = new LogManager(config.dataDir(), config.logDefaults(), time,
-                config.retentionCheckIntervalMs(), 15_000);
+                config.retentionCheckIntervalMs(), config.cleanerIntervalMs());
         this.committer = config.groupCommit()
                 ? new GroupCommitter("group-commit-" + config.brokerId(), config.groupCommitMaxWaitMicros(),
                         TimeUnit.MICROSECONDS, config.groupCommitMaxBatch())

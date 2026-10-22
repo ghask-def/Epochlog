@@ -35,6 +35,7 @@ public record BrokerConfig(
         long sessionTimeoutMs,
         long requestTimeoutMs,
         long retentionCheckIntervalMs,
+        long cleanerIntervalMs,
         int maxRequestBytes,
         int offsetsTopicPartitions,
         long maxClockDriftMs,
@@ -43,7 +44,8 @@ public record BrokerConfig(
     public static BrokerConfig from(Config c) {
         Map<String, String> logKeys = new HashMap<>();
         c.asMap().forEach((k, v) -> {
-            if (k.startsWith("log.") && !k.equals("log.retention.check.interval.ms")) {
+            if (k.startsWith("log.") && !k.equals("log.retention.check.interval.ms")
+                    && !k.equals("log.cleaner.interval.ms")) {
                 logKeys.put(k.substring(4), v);
             }
         });
@@ -71,6 +73,7 @@ public record BrokerConfig(
                 c.getDurationMs("broker.session.timeout.ms", 6_000),
                 c.getDurationMs("request.timeout.ms", 30_000),
                 c.getDurationMs("log.retention.check.interval.ms", 300_000),
+                c.getDurationMs("log.cleaner.interval.ms", 15_000),
                 c.getInt("max.request.bytes", 100 << 20),
                 c.getInt("offsets.topic.partitions", 8),
                 c.getDurationMs("hlc.max.drift.ms", 500),
