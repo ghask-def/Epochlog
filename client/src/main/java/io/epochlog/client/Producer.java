@@ -108,7 +108,8 @@ public final class Producer implements AutoCloseable {
                     f = b.tryAppend(record.key(), record.value(), headers, size, config.batchSize());
                     q.batches.addLast(b);
                 }
-                wake = q.batches.size() > 1 || q.batches.peekLast().isFull(config.batchSize());
+                // A new batch needs its linger deadline scheduled; a full one should go now.
+                wake = newBatch || q.batches.size() > 1 || q.batches.peekLast().isFull(config.batchSize());
             }
             if (wake || config.lingerMs() == 0) {
                 LockSupport.unpark(sender);
