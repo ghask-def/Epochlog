@@ -19,8 +19,8 @@ import org.slf4j.LoggerFactory;
  * Key-based compaction. For each log with {@code cleanup.policy=compact}, builds a map of the
  * latest offset per key across the whole log and rewrites closed segments to keep only those
  * records. Offsets are preserved, so compacted batches have gaps. Records without a key are
- * kept, and batches from idempotent producers keep their header even when emptied so the
- * producer's sequence history survives a restart.
+ * kept. If a producer's last batch in the log is emptied, its header is kept anyway, so the
+ * producer's sequence number survives a restart and its next batch isn't rejected.
  *
  * <p>Thread-safety: thread-safe. Runs on its own background thread; segment swaps go through
  * {@link Log#replaceSegment}, which takes the log's structural lock.
@@ -76,8 +76,12 @@ public final class LogCleaner implements Closeable {
             return 0;
         }
         Map<ByteBuffer, Long> latest = new HashMap<>();
+        Map<Long, Long> lastBatchOfProducer = new HashMap<>();
         for (LogSegment seg : log.segments()) {
             seg.forEachBatch(batch -> {
+                if (batch.hasProducerId()) {
+                    lastBatchOfProducer.put(batch.producerId(), batch.lastOffset());
+                }
                 for (Record r : batch.records()) {
                     if (r.key() != null) {
                         latest.put(ByteBuffer.wrap(r.key()), r.offset());
@@ -103,7 +107,8 @@ public final class LogCleaner implements Closeable {
                         return;
                     }
                     dropped[0] += records.size() - keep.size();
-                    if (keep.isEmpty() && !batch.hasProducerId()) {
+                    if (keep.isEmpty() && (!batch.hasProducerId()
+                            || lastBatchOfProducer.get(batch.producerId()) != batch.lastOffset())) {
                         return;
                     }
                     cleaned.append(rebuild(batch, keep));
