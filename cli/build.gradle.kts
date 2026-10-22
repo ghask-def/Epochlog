@@ -14,9 +14,12 @@ tasks.withType<JavaCompile>().configureEach {
     options.compilerArgs.add("-Aproject=${project.group}/${project.name}")
 }
 
+val cliJvmArgs = listOf("-Dlogback.configurationFile=logback-cli.xml")
+
 application {
     mainClass = "io.epochlog.cli.EpochlogCli"
     applicationName = "epochlog"
+    applicationDefaultJvmArgs = cliJvmArgs
 }
 
 // One launcher per tool, so the scripts read like the commands in the README.
@@ -31,6 +34,7 @@ tools.forEach { (scriptName, mainClassName) ->
         mainClass = mainClassName
         outputDir = layout.buildDirectory.dir("tool-scripts/$scriptName").get().asFile
         classpath = tasks.named<CreateStartScripts>("startScripts").get().classpath
+        defaultJvmOpts = cliJvmArgs
     }
     distributions.main.get().contents.from(task) { into("bin") }
 }

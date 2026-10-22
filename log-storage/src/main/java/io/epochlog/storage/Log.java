@@ -152,8 +152,12 @@ public final class Log implements Closeable {
         epochCache.truncateFromEnd(logEndOffset);
         epochCache.truncateFromStart(logStartOffset);
         rebuildProducerState();
-        LOG.info("{}: loaded {} segments, start={}, end={}, recovered={}, clean={}", topicPartition,
-                segments.size(), logStartOffset, logEndOffset, recovered, clean);
+        if (bases.isEmpty()) {
+            LOG.info("{}: created new log at offset {}", topicPartition, logEndOffset);
+        } else {
+            LOG.info("{}: loaded {} segments, start={}, end={}, recovered={}, clean shutdown={}", topicPartition,
+                    segments.size(), logStartOffset, logEndOffset, recovered, clean);
+        }
     }
 
     private List<Long> listBases() {

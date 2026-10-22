@@ -1,0 +1,56 @@
+# Three brokers and a controller.
+#   docker compose -f deploy/docker-compose.yml up --build
+x-broker: &broker
+  image: epochlog:latest
+  command: ["epochlog-broker"]
+  depends_on: [controller]
+  restart: unless-stopped
+
+services:
+  controller:
+    image: epochlog:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["epochlog-controller"]
+    environment:
+      EPOCHLOG_PORT: "9090"
+      EPOCHLOG_DATA_DIR: /var/lib/epochlog/controller
+    volumes: [controller-data:/var/lib/epochlog]
+    ports: ["9090:9090"]
+
+  broker1:
+    <<: *broker
+    environment:
+      EPOCHLOG_BROKER_ID: "1"
+      EPOCHLOG_ADVERTISED_HOST: broker1
+      EPOCHLOG_CONTROLLER: controller:9090
+      EPOCHLOG_DATA_DIR: /var/lib/epochlog/data
+      EPOCHLOG_MIN_INSYNC_REPLICAS: "2"
+    volumes: [broker1-data:/var/lib/epochlog]
+
+  broker2:
+    <<: *broker
+    environment:
+      EPOCHLOG_BROKER_ID: "2"
+      EPOCHLOG_ADVERTISED_HOST: broker2
+      EPOCHLOG_CONTROLLER: controller:9090
+      EPOCHLOG_DATA_DIR: /var/lib/epochlog/data
+      EPOCHLOG_MIN_INSYNC_REPLICAS: "2"
+    volumes: [broker2-data:/var/lib/epochlog]
+
+  broker3:
+    <<: *broker
+    environment:
+      EPOCHLOG_BROKER_ID: "3"
+      EPOCHLOG_ADVERTISED_HOST: broker3
+      EPOCHLOG_CONTROLLER: controller:9090
+      EPOCHLOG_DATA_DIR: /var/lib/epochlog/data
+      EPOCHLOG_MIN_INSYNC_REPLICAS: "2"
+    volumes: [broker3-data:/var/lib/epochlog]
+
+volumes:
+  controller-data:
+  broker1-data:
+  broker2-data:
+  broker3-data:
