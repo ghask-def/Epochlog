@@ -13,6 +13,7 @@ import io.epochlog.protocol.message.InitProducerIdRequest;
 import io.epochlog.protocol.message.InitProducerIdResponse;
 import io.epochlog.protocol.message.ProduceRequest;
 import io.epochlog.protocol.message.ProduceResponse;
+import java.net.InetSocketAddress;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -25,6 +26,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.UnaryOperator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -64,8 +66,17 @@ public final class Producer implements AutoCloseable {
     }
 
     public Producer(ClientConfig config) {
+        this(config, UnaryOperator.identity());
+    }
+
+    /**
+     * @param resolver maps broker addresses to the addresses actually dialed; tests use it to
+     *     route traffic through fault-injecting proxies
+     */
+    public Producer(ClientConfig config, UnaryOperator<InetSocketAddress> resolver) {
         this.config = config;
-        this.network = new NetworkClient("producer-" + config.clientId(), config.clientId(), config.requestTimeoutMs());
+        this.network = new NetworkClient("producer-" + config.clientId(), config.clientId(), config.requestTimeoutMs(),
+                resolver);
         this.metadata = new ClientMetadata(config.bootstrap(), network);
         this.bufferBytes = new Semaphore((int) Math.min(Integer.MAX_VALUE, config.bufferMemory()));
         this.sender = Thread.ofPlatform().name("producer-sender-" + config.clientId()).daemon().start(this::runSender);

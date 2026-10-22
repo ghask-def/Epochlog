@@ -6,11 +6,13 @@ import io.epochlog.protocol.message.CreateTopicRequest;
 import io.epochlog.protocol.message.ErrorResponse;
 import io.epochlog.protocol.message.MetadataRequest;
 import io.epochlog.protocol.message.MetadataResponse;
+import java.net.InetSocketAddress;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.UnaryOperator;
 
 /**
  * Topic administration and cluster inspection.
@@ -23,8 +25,17 @@ public final class Admin implements AutoCloseable {
     private final ClientMetadata metadata;
 
     public Admin(ClientConfig config) {
+        this(config, UnaryOperator.identity());
+    }
+
+    /**
+     * @param resolver maps broker addresses to the addresses actually dialed; tests use it to
+     *     route traffic through fault-injecting proxies
+     */
+    public Admin(ClientConfig config, UnaryOperator<InetSocketAddress> resolver) {
         this.config = config;
-        this.network = new NetworkClient("admin-" + config.clientId(), config.clientId(), config.requestTimeoutMs());
+        this.network = new NetworkClient("admin-" + config.clientId(), config.clientId(), config.requestTimeoutMs(),
+                resolver);
         this.metadata = new ClientMetadata(config.bootstrap(), network);
     }
 

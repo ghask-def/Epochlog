@@ -13,6 +13,7 @@ import io.epochlog.protocol.message.FetchRequest;
 import io.epochlog.protocol.message.FetchResponse;
 import io.epochlog.protocol.message.ListOffsetsRequest;
 import io.epochlog.protocol.message.ListOffsetsResponse;
+import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -29,6 +30,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.UnaryOperator;
 
 /**
  * Pull-based consumer for explicitly assigned partitions. Reads only committed data (up to the
@@ -62,8 +64,17 @@ public final class Consumer implements AutoCloseable {
             Throwable error) {}
 
     public Consumer(ClientConfig config) {
+        this(config, UnaryOperator.identity());
+    }
+
+    /**
+     * @param resolver maps broker addresses to the addresses actually dialed; tests use it to
+     *     route traffic through fault-injecting proxies
+     */
+    public Consumer(ClientConfig config, UnaryOperator<InetSocketAddress> resolver) {
         this.config = config;
-        this.network = new NetworkClient("consumer-" + config.clientId(), config.clientId(), config.requestTimeoutMs());
+        this.network = new NetworkClient("consumer-" + config.clientId(), config.clientId(), config.requestTimeoutMs(),
+                resolver);
         this.metadata = new ClientMetadata(config.bootstrap(), network);
         this.offsets = new OffsetClient(network, metadata, config.requestTimeoutMs(), config.retryBackoffMs());
     }
