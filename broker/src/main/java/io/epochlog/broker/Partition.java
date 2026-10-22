@@ -179,6 +179,11 @@ public final class Partition implements AutoCloseable {
             }
             LogAppendInfo info;
             try {
+                if (batch.baseTimestamp() >= 0) {
+                    // The producer's clock reading is a receive event for our HLC. Readings too far
+                    // ahead are counted and ignored by observe().
+                    clock.observe(batch.maxTimestamp());
+                }
                 long stamp = clock.reserve(batch.lastOffsetDelta() + 1);
                 info = log.appendAsLeader(batch, leaderEpoch, stamp);
                 if (info.maxTimestamp() > clock.current()) {
