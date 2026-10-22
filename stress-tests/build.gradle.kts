@@ -6,6 +6,7 @@ dependencies {
     implementation(project(":concurrency"))
     implementation(project(":log-storage"))
     implementation(project(":clock"))
+    implementation(project(":replication"))
     implementation(libs.jcstress.core)
     annotationProcessor(libs.jcstress.core)
 }
