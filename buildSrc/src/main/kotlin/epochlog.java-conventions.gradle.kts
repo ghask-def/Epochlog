@@ -55,3 +55,8 @@ tasks.jacocoTestReport {
 dependencies {
     "testImplementation"("org.junit.jupiter:junit-jupiter-params")
 }
+
+val javaToolchains = extensions.getByType<JavaToolchainService>()
+tasks.withType<JavaExec>().configureEach {
+    javaLauncher = javaToolchains.launcherFor(java.toolchain)
+}

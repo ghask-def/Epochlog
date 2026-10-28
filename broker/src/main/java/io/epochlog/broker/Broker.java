@@ -103,6 +103,9 @@ public class Broker implements AutoCloseable {
     public void start() throws IOException {
         logManager.startup();
         replicaManager = createReplicaManager();
+        ReplicaManager rm = replicaManager;
+        logManager.setRetentionUpperBound(log -> rm.partition(log.topicPartition())
+                .map(Partition::highWatermark).orElse(0L));
         if (!config.standalone()) {
             controllerClient = new NetworkClient("broker-" + config.brokerId() + "-controller",
                     "broker-" + config.brokerId(), config.requestTimeoutMs(), resolver);
