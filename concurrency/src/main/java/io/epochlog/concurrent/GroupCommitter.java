@@ -6,6 +6,10 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
@@ -17,8 +21,12 @@ import org.slf4j.LoggerFactory;
  * thread collects requests for up to {@code maxWait} (or until {@code maxBatch} requests are
  * waiting), syncs each distinct target once, and completes every future whose offset is covered.
  * Under load one fsync covers many appends, which is where most of the throughput comes from.
+ * When a round covers several files (one per partition), their fsyncs are issued in parallel;
+ * the device handles them concurrently, so a round costs about one fsync rather than one per
+ * partition.
  *
- * <p>Thread-safety: {@link #commit} is thread-safe. Syncs run only on the committer thread.
+ * <p>Thread-safety: {@link #commit} is thread-safe. Rounds are driven by the committer thread;
+ * within a round each target is synced by at most one thread.
  */
 public final class GroupCommitter implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(GroupCommitter.class);
@@ -26,8 +34,8 @@ public final class GroupCommitter implements AutoCloseable {
     /**
      * Something that can be made durable.
      *
-     * <p>Thread-safety: {@link #sync} is called from the committer thread only, but concurrently
-     * with the target's own writer.
+     * <p>Thread-safety: {@link #sync} is never called concurrently with itself for the same
+     * target, but may run concurrently with the target's own writer and with other targets' syncs.
      */
     @FunctionalInterface
     public interface Syncable {
@@ -45,6 +53,7 @@ public final class GroupCommitter implements AutoCloseable {
     private final long maxWaitNanos;
     private final int maxBatch;
     private final Thread thread;
+    private final ExecutorService syncPool = Executors.newVirtualThreadPerTaskExecutor();
     private final LongAdder syncs = new LongAdder();
     private final LongAdder commits = new LongAdder();
     private volatile boolean parked;
@@ -108,18 +117,22 @@ public final class GroupCommitter implements AutoCloseable {
     }
 
     private void syncAll(List<Request> batch) {
+        Map<Syncable, Future<Long>> inFlight = new IdentityHashMap<>();
+        for (Request r : batch) {
+            inFlight.computeIfAbsent(r.target, t -> syncPool.submit(t::sync));
+        }
         Map<Syncable, Long> durable = new IdentityHashMap<>();
         Map<Syncable, Throwable> failed = new IdentityHashMap<>();
-        for (Request r : batch) {
-            if (durable.containsKey(r.target) || failed.containsKey(r.target)) {
-                continue;
-            }
+        for (Map.Entry<Syncable, Future<Long>> e : inFlight.entrySet()) {
             try {
-                durable.put(r.target, r.target.sync());
+                durable.put(e.getKey(), e.getValue().get());
                 syncs.increment();
-            } catch (IOException | RuntimeException e) {
-                LOG.error("fsync failed", e);
-                failed.put(r.target, e);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                failed.put(e.getKey(), ie);
+            } catch (ExecutionException ee) {
+                LOG.error("fsync failed", ee.getCause());
+                failed.put(e.getKey(), ee.getCause());
             }
         }
         commits.add(batch.size());
@@ -154,5 +167,6 @@ public final class GroupCommitter implements AutoCloseable {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+        syncPool.shutdown();
     }
 }
