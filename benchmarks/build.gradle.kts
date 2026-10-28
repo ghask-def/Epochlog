@@ -5,6 +5,9 @@ plugins {
 dependencies {
     implementation(project(":log-storage"))
     implementation(project(":concurrency"))
+    implementation(project(":broker"))
+    implementation(project(":controller"))
+    implementation(project(":client"))
     implementation(libs.jmh.core)
     annotationProcessor(libs.jmh.processor)
     runtimeOnly(libs.logback.classic)
@@ -21,5 +24,17 @@ tasks.register<JavaExec>("jmh") {
     classpath = sourceSets.main.get().runtimeClasspath
     mainClass = "org.openjdk.jmh.Main"
     val extra = providers.gradleProperty("jmh.args").getOrElse("")
+    args(extra.split(" ").filter { it.isNotBlank() })
+}
+
+tasks.register<JavaExec>("loadgen") {
+    group = "benchmark"
+    description = "End-to-end load test against an in-process 3-broker cluster. -Ploadgen.args='seconds=10 ...'"
+    dependsOn(tasks.classes)
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass = "io.epochlog.bench.LoadGenerator"
+    maxHeapSize = "4g"
+    jvmArgs("-XX:+UseZGC", "-XX:+ZGenerational")
+    val extra = providers.gradleProperty("loadgen.args").getOrElse("")
     args(extra.split(" ").filter { it.isNotBlank() })
 }
